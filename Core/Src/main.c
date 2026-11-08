@@ -32,27 +32,27 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 typedef struct {
-int16_t rocker_l_;//左水�?
-int16_t rocker_l1;//左数�?
-int16_t rocker_r_;//右水�?
-int16_t rocker_r1;//右数�?
-int16_t SWA;//�?关A
-int16_t SWB;//�?关B
-int16_t SWC;//�?关C
-int16_t SWD;//�?关D
-int16_t VRA;//旋钮A
-int16_t VRB;//旋钮B
-uint8_t error_protect;//故障保护�?活位
+int16_t rocker_l_;
+int16_t rocker_l1;
+int16_t rocker_r_;
+int16_t rocker_r1;
+int16_t SWA;
+int16_t SWB;
+int16_t SWC;
+int16_t SWD;
+int16_t VRA;
+int16_t VRB;
+uint8_t error_protect;
 uint8_t byte_lose;//真丢失标志位
 uint8_t offline;//超过100ms没收到有效帧就置1
 
 
 }RC_ctrl_t;
 
-static RC_ctrl_t rc_data;//遥控器数�?
+static RC_ctrl_t rc_data;//遥控器
 
-int16_t CH[16];//存放解析后的16个�?�道数据
-uint8_t start_byte,flag_byte,stop_byte;//代表状�?�的变量
+int16_t CH[16];//存放解析后的16个通道数据
+uint8_t start_byte,flag_byte,stop_byte;//代表状态的变量
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -82,8 +82,8 @@ static void MX_USART3_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// 这个函数可以�? buf 里的乱码�? 11 位一组切出来，并减去 1024
-//串口发的数据是八位，但是摇杆的位置需�?11�?
+// 这个函数可以进行 11 位一组切出来，并减去 1024
+//串口发的数据是八位，但是摇杆的位置需要11位
 //0x07FF:保留11�?
 void BufToChannel(void) {
   CH[0] = ((((int16_t)buf_copy[1] >> 0) | ((int16_t)buf_copy[2] << 8)) & 0x07FF) - 1024;
@@ -131,11 +131,11 @@ int main(void)
   MX_DMA_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  //启动串口DMA空闲中断接收，长�?25
+  //启动串口DMA空闲中断接收
 HAL_UARTEx_ReceiveToIdle_DMA(&huart3,buf,25);
 //关闭半传输中断（设计漏洞�?
 __HAL_DMA_DISABLE_IT(huart3.hdmarx,DMA_IT_HT);
-last_frame_tick = HAL_GetTick();//先记一下时间，避免一上电就报离线
+last_frame_tick = HAL_GetTick();//先记一下时间，避免一上电就离线
 
   /* USER CODE END 2 */
 
