@@ -21,12 +21,20 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+//定义一个结构体存电机数据
+typedef struct{
+  uint16_t ecd;//编码器值（8191）
+  int16_t speed_rpm;//转速
+  int16_t real_current;//实际电流
+  int16_t real_current_handle;//滤波后的电流
+  uint8_t temperature;//温度
 
+}motor_measure_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -49,10 +57,10 @@ uint8_t offline;//超过100ms没收到有效帧就置1
 
 }RC_ctrl_t;
 
-static RC_ctrl_t rc_data;//遥控器
+static RC_ctrl_t rc_data;//遥控�?
 
-int16_t CH[16];//存放解析后的16个通道数据
-uint8_t start_byte,flag_byte,stop_byte;//代表状态的变量
+int16_t CH[16];//存放解析后的16个�?�道数据
+uint8_t start_byte,flag_byte,stop_byte;//代表状�?�的变量
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -61,14 +69,31 @@ uint8_t start_byte,flag_byte,stop_byte;//代表状态的变量
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef hcan1;
+
 UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_rx;
 
 /* USER CODE BEGIN PV */
+ int16_t current_cmd = 0;//变为全局变量，方便在Ozone里面查看数据表现
+motor_measure_t motor1_measure;
+
+//发送电流指令时单片机只能一个字节一个字节地发，这里把电流拆成2个字节，再配上6个0，再配上6个0，凑齐八个字节装进去
+uint8_t can1_tx_buff[8];
+//电机接收指令后回信，根据数据格式去拆解数据，大疆的电调回信固定是8个字节，单片机把收到的数据暂时存在这个里面
+uint8_t can1_rx_buff[8];
+//只有数据不行，这里告诉CAN硬件如何去传递，这里里面有标准帧ID，控制电调是0x200，标准帧，长度（8字节），在之后对里面的东西进行处理
+CAN_TxHeaderTypeDef motor1_txconf;//发送报文头配置
+//单片机里面有3个邮箱，调用发送函数时（HAL——CAN_AddMessage)，硬件会自动找一个去发数据，然后tx_mailbox就会记录硬件用了第几个邮箱，由硬件自己去发送
+uint32_t tx_mailbox;             //发送邮箱编号（发送时要传这个参数）
+
+
+
+
 volatile uint8_t data_ready_flag = 0;
 uint8_t buf[25];//DMA接收
 uint8_t buf_copy[25];//临时储存
-volatile uint32_t last_frame_tick = 0;//最后一次收到有效帧的时间
+volatile uint32_t last_frame_tick = 0;//�?后一次收到有效帧的时�?
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,6 +101,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -83,8 +109,8 @@ static void MX_USART3_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 // 这个函数可以进行 11 位一组切出来，并减去 1024
-//串口发的数据是八位，但是摇杆的位置需要11位
-//0x07FF:保留11�?
+//串口发的数据是八位，但是摇杆的位置需�?11�?
+//0x07FF:保留11�??
 void BufToChannel(void) {
   CH[0] = ((((int16_t)buf_copy[1] >> 0) | ((int16_t)buf_copy[2] << 8)) & 0x07FF) - 1024;
   CH[1] = ((((int16_t)buf_copy[2] >> 3) | ((int16_t)buf_copy[3] << 5)) & 0x07FF) - 1024;
@@ -130,12 +156,65 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART3_UART_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
+
+  // 1. 配置发送报文头 (控制1号电调用)
+  //对各个数据进行填写，告诉单片机怎么给电机发指令，大疆规定给1~4号电机发指令，标准帧ID必须写0x200
+  motor1_txconf.StdId = 0x200;// 标准帧ID，控制1~4号电调
+  motor1_txconf.IDE = CAN_ID_STD;   // 标准帧
+  motor1_txconf.RTR = CAN_RTR_DATA;   // 数据帧
+  motor1_txconf.DLC = 8;     // 数据长度8字节
+  motor1_txconf.TransmitGlobalTime = DISABLE;
+
+  // 2. 配置CAN1过滤器（只接收0x201电调反馈）
+  CAN_FilterTypeDef can1_filter;//使用
+  //配置参数
+  can1_filter.FilterMode = CAN_FILTERMODE_IDLIST; // 打开列表模式
+  can1_filter.FilterScale = CAN_FILTERSCALE_16BIT; // 16位宽度
+  can1_filter.FilterFIFOAssignment = CAN_RX_FIFO1; // 存入FIFO1
+  can1_filter.FilterBank = 0;               // 使用第0组过滤器
+  can1_filter.SlaveStartFilterBank = 14;     // 0~13给CAN1，14~27给CAN2
+  
+  // 将0x201左移5位，填满4个匹配项（死规则）
+  can1_filter.FilterIdHigh = (0x201 << 5); // 16位模式下，高寄存器放标准ID
+  can1_filter.FilterIdLow = (0x201 << 5); 
+  can1_filter.FilterMaskIdHigh = (0x201 << 5); // 列表模式下，Mask也填ID
+  can1_filter.FilterMaskIdLow = (0x201 << 5);
+  can1_filter.FilterActivation = ENABLE;       // 开启过滤器
+
+  // 3. 将过滤器配置写入硬件
+  if (HAL_CAN_ConfigFilter(&hcan1, &can1_filter) != HAL_OK)
+  {
+  // 如果配置失败，进入死循环
+      Error_Handler();
+  }
+
+  // 4. 启动CAN1
+  if (HAL_CAN_Start(&hcan1) != HAL_OK)//启动并且进行启动失败的错误处理
+  {
+      Error_Handler();
+  }
+
+  // 5. 开启FIFO1接收中断（电调反馈存在FIFO1）
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO1_MSG_PENDING) != HAL_OK)
+  {
+      Error_Handler();
+  }
+  
+  // 算正弦波
+  float phase = 0.0f;//定义一个变量对应正弦波
+ 
+
+
+
+
+
   //启动串口DMA空闲中断接收
 HAL_UARTEx_ReceiveToIdle_DMA(&huart3,buf,25);
-//关闭半传输中断（设计漏洞�?
+//关闭半传输中断（设计漏洞�??
 __HAL_DMA_DISABLE_IT(huart3.hdmarx,DMA_IT_HT);
-last_frame_tick = HAL_GetTick();//先记一下时间，避免一上电就离线
+last_frame_tick = HAL_GetTick();//先记�?下时间，避免�?上电就离�?
 
   /* USER CODE END 2 */
 
@@ -156,7 +235,7 @@ last_frame_tick = HAL_GetTick();//先记一下时间，避免一上电就离线
     flag_byte = buf_copy[23];
         stop_byte = buf_copy[24];
         
-        // 把解析出来的值赋值
+        // 把解析出来的值赋�?
     rc_data.rocker_r_ = CH[0]; 
     rc_data.rocker_r1 = CH[1]; 
     rc_data.rocker_l1 = CH[2]; 
@@ -168,18 +247,54 @@ last_frame_tick = HAL_GetTick();//先记一下时间，避免一上电就离线
    rc_data.VRA       = CH[8];
     rc_data.VRB       = CH[9];
         
-        // 状态改变标志位（用位运算抠出来）
+        // 状�?�改变标志位（用位运算抠出来�?
         rc_data.error_protect = (flag_byte >> 3) & 0x01;
         rc_data.byte_lose     = (flag_byte >> 2) & 0x01;
     }
-    //超过100ms没收到新的，就认为遥控器断开了（要求的100ms处理）
+    //超过100ms没收到新的，就认为遥控器断开了（要求�?100ms处理�?
   
     if(HAL_GetTick() - last_frame_tick > 100){//本来用的后面发现错了
       rc_data.offline = 1;
     }else{
       rc_data.offline = 0;
     }
-  }
+  
+
+//第五周主循环
+    // 1. 生成正弦变化的电流指令 (幅值1000)
+    current_cmd = (int16_t)(1000.0f * sinf(phase));//算出目标电流值
+    phase += 0.02f * 3.14159265f; // 调整正弦波的频率
+    if (phase > 2.0f * 3.14159265f) {
+        phase -= 2.0f * 3.14159265f; // 防止phase一直增加导致浮点数溢出
+    }
+
+    // 2. 判断CAN1是否有空闲发送邮箱
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+    {
+        // 3. 组装数据 (1号电调占 DATA[0] 和 DATA[1])
+        // 必须把 int16_t 强转为 uint16_t，方便位移操作
+        uint16_t raw_current = (uint16_t)current_cmd; 
+        
+        // 高字节在前
+        can1_tx_buff[0] = (uint8_t)(raw_current >> 8);//大疆规定高字节在前
+        // 低字节在后
+        can1_tx_buff[1] = (uint8_t)(raw_current & 0xFF);//只保留最后八位
+        
+        // 因为没有接2、3、4号电调，剩下的字节填0
+        for (uint8_t i = 2; i < 8; i++) {
+            can1_tx_buff[i] = 0;//剩下的都填进去0，因为只用了1好电机
+        }
+
+        // 4. 发送报文
+        HAL_CAN_AddTxMessage(&hcan1, &motor1_txconf, can1_tx_buff, &tx_mailbox);
+    }
+    
+    // 5. 延时10ms
+    HAL_Delay(10);//控制电机不可以发的太快了
+}
+
+
+
   /* USER CODE END 3 */
 }
 
@@ -226,6 +341,43 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+
+  /* USER CODE BEGIN CAN1_Init 0 */
+
+  /* USER CODE END CAN1_Init 0 */
+
+  /* USER CODE BEGIN CAN1_Init 1 */
+
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 3;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_10TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_3TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = ENABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = ENABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN1_Init 2 */
+
+  /* USER CODE END CAN1_Init 2 */
+
 }
 
 /**
@@ -289,6 +441,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
 
@@ -309,14 +462,14 @@ last_frame_tick = HAL_GetTick();
     
     
         
-        // 处理完后，必须再次开启接收，否则只能收一次(第一次直接忘了)
+        // 处理完后，必须再次开启接收，否则只能收一�?(第一次直接忘�?)
         HAL_UARTEx_ReceiveToIdle_DMA(&huart3, buf, 25);
         __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
     }
 }
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
     if (huart == &huart3) {
-        //先把接收停掉，把错误标志清干净，不然可能一直卡在错误里
+        //先把接收停掉，把错误标志清干�?，不然可能一直卡在错误里
         HAL_UART_AbortReceive(&huart3);
         __HAL_UART_CLEAR_OREFLAG(huart);
         __HAL_UART_CLEAR_FEFLAG(huart);
@@ -324,15 +477,59 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
         __HAL_UART_CLEAR_PEFLAG(huart);
         huart->ErrorCode = HAL_UART_ERROR_NONE;
 
-        //重新开启接收，启动失败再试一次
+        //重新�?启接收，启动失败再试�?�?
         if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3, buf, 25) != HAL_OK) {
             HAL_UART_AbortReceive(&huart3);
             HAL_UARTEx_ReceiveToIdle_DMA(&huart3, buf, 25);
         }
         __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
     }
-    //我真的尽力了，最后还是被ai检查出来这个东西没写，过不了关
+    //我真的尽力了，最后还是被ai�?查出来这个东西没写，过不了关
 }
+
+
+//第五周回调函数
+
+// FIFO1接收回调
+void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan)//规定的回调函数
+{
+    CAN_RxHeaderTypeDef rx_header;//申请一个临时的去存电机回的头部信息
+    
+    // 判断是不是CAN1触发的中断
+    if (hcan->Instance == CAN1)//确定不是其他的误触的
+    {
+        // while循环读取，直到FIFO1为空（防止一次来多帧）
+  while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO1) > 0)//一号邮箱里面有没有空
+   {
+            // 取出报文到 rx_header 和 can1_rx_buff 里
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header, can1_rx_buff) == HAL_OK)
+  {
+             // 确认是 0x201 发来的，且是标准帧STD、8字节
+         if (rx_header.StdId == 0x201 && rx_header.IDE == CAN_ID_STD && rx_header.DLC == 8)
+{
+                    // 1. 之前定义的结构体 解析编码器值（高字节左移8位，再按位或低字节）
+    motor1_measure.ecd = (uint16_t)((can1_rx_buff[0] << 8) | can1_rx_buff[1]);
+                    
+                // 2. 解析转速 (注意：要强转成有符号 int16_t)
+           motor1_measure.speed_rpm = (int16_t)((can1_rx_buff[2] << 8) | can1_rx_buff[3]);
+                    
+                 // 3. 解析实际电流
+          motor1_measure.real_current = (int16_t)((can1_rx_buff[4] << 8) | can1_rx_buff[5]);
+                    
+                    // 4. 解析温度
+           motor1_measure.temperature = can1_rx_buff[6];
+
+                    // 5. 一阶低通滤波 (alpha = 0.1f，越小越平滑但滞后越大)
+                    float alpha = 0.1f;//滤波系数
+             motor1_measure.real_current_handle = (int16_t)((1.0f - alpha) * motor1_measure.real_current_handle + alpha * motor1_measure.real_current);
+         }
+       }
+      }
+  }
+}
+
+
+
 /* USER CODE END 4 */
 
 /**

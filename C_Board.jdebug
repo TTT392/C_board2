@@ -1,0 +1,12 @@
+void OnProjectLoad (void) {
+  Project.SetDevice("STM32F407IG");
+  Project.SetHostIF("USB", "0");
+  Project.SetTargetIF("SWD");
+  Project.SetTIFSpeed("1 MHz");
+  Project.AddRootPath("D:/STM32/Key/C_Board");
+  File.Open("D:/STM32/Key/C_Board/build/C_Board.elf");
+
+  Watch.Add("current_cmd");
+  Watch.Add("motor1_measure.real_current");
+  Watch.Add("motor1_measure.real_current_handle");
+}
